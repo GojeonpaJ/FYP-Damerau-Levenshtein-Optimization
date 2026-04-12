@@ -1,0 +1,31 @@
+# Visual Studio cache and user-specific files
+.vs/
+*.user
+*.suo
+*.vcxproj.user
+
+# Build output directories
+x64/
+Debug/
+Release/
+build/
+out/
+
+# Intermediate files
+*.obj
+*.pdb
+*.ilk
+*.ipch
+*.tlog
+*.log
+*.tmp
+
+# Executables and libraries
+*.exe
+*.dll
+*.lib
+*.exp
+
+# OS files
+Thumbs.db
+.DS_Store
