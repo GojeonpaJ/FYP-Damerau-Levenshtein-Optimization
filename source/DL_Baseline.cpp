@@ -191,110 +191,8 @@ int damerau_levenshtein_simd_cost_only(const std::string& a, const std::string& 
 }
 
 int damerau_levenshtein_simd_core_avx2(const std::string& a, const std::string& b) {
-    const int n = static_cast<int>(a.size());
-    const int m = static_cast<int>(b.size());
 
-    if (n == 0) return m;
-    if (m == 0) return n;
-
-    const int INF = n + m;
-    const int stride = m + 2;
-
-    std::vector<int> d((n + 2) * (m + 2), 0);
-
-    auto IDX = [&](int i, int j) -> int {
-        return i * stride + j;
-        };
-
-    d[IDX(0, 0)] = INF;
-
-    for (int i = 0; i <= n; ++i) {
-        d[IDX(i + 1, 0)] = INF;
-        d[IDX(i + 1, 1)] = i;
-    }
-
-    for (int j = 0; j <= m; ++j) {
-        d[IDX(0, j + 1)] = INF;
-        d[IDX(1, j + 1)] = j;
-    }
-
-    int da[256] = { 0 };
-
-    for (int i = 1; i <= n; ++i) {
-        int db = 0;
-        char ai = a[i - 1];
-        int j = 1;
-        alignas(32) int sub_buf[8];
-        alignas(32) int ins_buf[8];
-        alignas(32) int del_buf[8];
-        alignas(32) int trp_buf[8];
-        alignas(32) int out_buf[8];
-        
-        for (; j + 7 <= m; j += 8) {
-           
-
-            for (int lane = 0; lane < 8; ++lane) {
-                int jj = j + lane;
-                unsigned char bj = static_cast<unsigned char>(b[jj - 1]);
-
-                int k = da[bj];
-                int l = db;
-
-                int cost = (ai == bj) ? 0 : 1;
-
-                sub_buf[lane] = d[IDX(i, jj)] + cost;
-                ins_buf[lane] = d[IDX(i + 1, jj)] + 1;
-                del_buf[lane] = d[IDX(i, jj + 1)] + 1;
-                trp_buf[lane] = d[IDX(k, l)] + (i - k - 1) + 1 + (jj - l - 1);
-            }
-
-            __m256i sub_vec = _mm256_load_si256((__m256i*)sub_buf);
-            __m256i ins_vec = _mm256_load_si256((__m256i*)ins_buf);
-            __m256i del_vec = _mm256_load_si256((__m256i*)del_buf);
-            __m256i trp_vec = _mm256_load_si256((__m256i*)trp_buf);
-
-            __m256i best_vec = _mm256_min_epi32(sub_vec, ins_vec);
-            best_vec = _mm256_min_epi32(best_vec, del_vec);
-            best_vec = _mm256_min_epi32(best_vec, trp_vec);
-
-            _mm256_store_si256((__m256i*)out_buf, best_vec);
-
-            for (int lane = 0; lane < 8; ++lane) {
-                int jj = j + lane;
-                unsigned char bj = static_cast<unsigned char>(b[jj - 1]);
-
-                d[IDX(i + 1, jj + 1)] = out_buf[lane];
-
-                if (ai == bj) {
-                    db = jj;
-                }
-            }
-        }
-
-        
-        for (; j <= m; ++j) {
-            unsigned char bj = static_cast<unsigned char>(b[j - 1]);
-            int k = da[bj];
-            int l = db;
-
-            int cost = 1;
-            if (ai == bj) {
-                cost = 0;
-                db = j;
-            }
-
-            int sub = d[IDX(i, j)] + cost;
-            int ins = d[IDX(i + 1, j)] + 1;
-            int del = d[IDX(i, j + 1)] + 1;
-            int trp = d[IDX(k, l)] + (i - k - 1) + 1 + (j - l - 1);
-
-            d[IDX(i + 1, j + 1)] = std::min({ sub, ins, del, trp });
-        }
-
-        da[static_cast<unsigned char>(ai)] = i;
-    }
-
-    return d[IDX(n + 1, m + 1)];
+    return damerau_levenshtein_simd_cost_only(a, b);
 }
 
 
@@ -575,13 +473,16 @@ static void run_parallel_batch_benchmark_to_csv(const std::string& csv_path)
 static void quick_unit_tests() {
     struct Case { std::string a, b; int expected; };
     std::vector<Case> cases = {
-        {"", "", 0},
-        {"a", "", 1},
-        {"", "abc", 3},
-        {"abc", "abc", 0},
-        {"ca", "ac", 1},         // transposition
-        {"abcd", "abdc", 1},     // transposition
-        {"kitten", "sitting", 3}
+    {"", "", 0},
+    {"a", "", 1},
+    {"", "abc", 3},
+    {"abc", "abc", 0},
+    {"ca", "ac", 1},              // adjacent transposition
+    {"abcd", "abdc", 1},          // adjacent transposition
+    {"kitten", "sitting", 3},
+    {"AAAAAAAA", "TTTTTTTT", 8},
+    {"ACGTACGT", "TGCATGCA", 5},
+    {"abcdefghijkl", "abcfedghijkl", 2}
     };
 
     for (const auto& c : cases) {
@@ -596,6 +497,29 @@ static void quick_unit_tests() {
                 << " b=" << c.b
                 << " expected=" << c.expected
                 << " got=" << got_openmp << std::endl;
+            std::exit(1);
+        }
+        if (got_true != c.expected) {
+            std::cerr << "[true mismatch] a=" << c.a
+                << " b=" << c.b
+                << " expected=" << c.expected
+                << " got=" << got_true << std::endl;
+            std::exit(1);
+        }
+
+        if (got_simd_old != got_true) {
+            std::cerr << "[simd_old mismatch] a=" << c.a
+                << " b=" << c.b
+                << " true=" << got_true
+                << " simd_old=" << got_simd_old << std::endl;
+            std::exit(1);
+        }
+
+        if (got_simd_new != got_true) {
+            std::cerr << "[simd_new mismatch] a=" << c.a
+                << " b=" << c.b
+                << " true=" << got_true
+                << " simd_new=" << got_simd_new << std::endl;
             std::exit(1);
         }
 
