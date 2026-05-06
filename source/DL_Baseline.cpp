@@ -114,7 +114,7 @@ int damerau_levenshtein_true(const std::string& a, const std::string& b) {
     return at(n + 1, m + 1);
 }
 
-int damerau_levenshtein_simd(const std::string& a, const std::string& b) {
+int damerau_levenshtein_simd_cost_only(const std::string& a, const std::string& b) {
     const int n = static_cast<int>(a.size());
     const int m = static_cast<int>(b.size());
 
@@ -190,6 +190,151 @@ int damerau_levenshtein_simd(const std::string& a, const std::string& b) {
     return at(n + 1, m + 1);
 }
 
+int damerau_levenshtein_simd_core_avx2(const std::string& a, const std::string& b) {
+    const int n = static_cast<int>(a.size());
+    const int m = static_cast<int>(b.size());
+
+    if (n == 0) return m;
+    if (m == 0) return n;
+
+    const int INF = n + m;
+    const int stride = m + 2;
+
+    std::vector<int> d((n + 2) * (m + 2), 0);
+
+    auto IDX = [&](int i, int j) -> int {
+        return i * stride + j;
+        };
+
+    d[IDX(0, 0)] = INF;
+
+    for (int i = 0; i <= n; ++i) {
+        d[IDX(i + 1, 0)] = INF;
+        d[IDX(i + 1, 1)] = i;
+    }
+
+    for (int j = 0; j <= m; ++j) {
+        d[IDX(0, j + 1)] = INF;
+        d[IDX(1, j + 1)] = j;
+    }
+
+    int da[256] = { 0 };
+
+    for (int i = 1; i <= n; ++i) {
+        int db = 0;
+        char ai = a[i - 1];
+        int j = 1;
+        alignas(32) int sub_buf[8];
+        alignas(32) int ins_buf[8];
+        alignas(32) int del_buf[8];
+        alignas(32) int trp_buf[8];
+        alignas(32) int out_buf[8];
+        
+        for (; j + 7 <= m; j += 8) {
+           
+
+            for (int lane = 0; lane < 8; ++lane) {
+                int jj = j + lane;
+                unsigned char bj = static_cast<unsigned char>(b[jj - 1]);
+
+                int k = da[bj];
+                int l = db;
+
+                int cost = (ai == bj) ? 0 : 1;
+
+                sub_buf[lane] = d[IDX(i, jj)] + cost;
+                ins_buf[lane] = d[IDX(i + 1, jj)] + 1;
+                del_buf[lane] = d[IDX(i, jj + 1)] + 1;
+                trp_buf[lane] = d[IDX(k, l)] + (i - k - 1) + 1 + (jj - l - 1);
+            }
+
+            __m256i sub_vec = _mm256_load_si256((__m256i*)sub_buf);
+            __m256i ins_vec = _mm256_load_si256((__m256i*)ins_buf);
+            __m256i del_vec = _mm256_load_si256((__m256i*)del_buf);
+            __m256i trp_vec = _mm256_load_si256((__m256i*)trp_buf);
+
+            __m256i best_vec = _mm256_min_epi32(sub_vec, ins_vec);
+            best_vec = _mm256_min_epi32(best_vec, del_vec);
+            best_vec = _mm256_min_epi32(best_vec, trp_vec);
+
+            _mm256_store_si256((__m256i*)out_buf, best_vec);
+
+            for (int lane = 0; lane < 8; ++lane) {
+                int jj = j + lane;
+                unsigned char bj = static_cast<unsigned char>(b[jj - 1]);
+
+                d[IDX(i + 1, jj + 1)] = out_buf[lane];
+
+                if (ai == bj) {
+                    db = jj;
+                }
+            }
+        }
+
+        
+        for (; j <= m; ++j) {
+            unsigned char bj = static_cast<unsigned char>(b[j - 1]);
+            int k = da[bj];
+            int l = db;
+
+            int cost = 1;
+            if (ai == bj) {
+                cost = 0;
+                db = j;
+            }
+
+            int sub = d[IDX(i, j)] + cost;
+            int ins = d[IDX(i + 1, j)] + 1;
+            int del = d[IDX(i, j + 1)] + 1;
+            int trp = d[IDX(k, l)] + (i - k - 1) + 1 + (j - l - 1);
+
+            d[IDX(i + 1, j + 1)] = std::min({ sub, ins, del, trp });
+        }
+
+        da[static_cast<unsigned char>(ai)] = i;
+    }
+
+    return d[IDX(n + 1, m + 1)];
+}
+
+
+int damerau_levenshtein_bp_scalar(const std::string& a, const std::string& b)
+{
+    const std::string* text = &a;
+    const std::string* pattern = &b;
+
+    
+    if (a.size() < b.size()) {
+        text = &b;
+        pattern = &a;
+    }
+
+    const int n = static_cast<int>(text->size());
+    const int m = static_cast<int>(pattern->size());
+
+    if (n == 0) return m;
+    if (m == 0) return n;
+
+   
+    if (m > 64) {
+        return damerau_levenshtein_true(a, b);
+    }
+
+    uint64_t Peq[256] = { 0 };
+
+    for (int j = 0; j < m; ++j) {
+        Peq[static_cast<unsigned char>((*pattern)[j])] |= (1ULL << j);
+    }
+
+    
+    return damerau_levenshtein_true(a, b);
+}
+
+int damerau_levenshtein_bp_avx2(const std::string& a, const std::string& b)
+{
+    return damerau_levenshtein_bp_scalar(a, b);
+}
+
 int damerau_levenshtein_openmp(const std::string& a, const std::string& b)
 {
     int result = 0;
@@ -242,16 +387,21 @@ static double batch_true_us(const std::vector<std::pair<std::string, std::string
     auto us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
     return static_cast<double>(us);
 }
-static double batch_openmp_us(const std::vector<std::pair<std::string, std::string>>& pairs)
-{
+static double batch_openmp_us(
+    const std::vector<std::pair<std::string, std::string>>& pairs,
+    int num_threads
+)
+{ 
     int sink = 0;
 
-    auto t0 = std::chrono::high_resolution_clock::now();
+omp_set_num_threads(num_threads);
 
-#pragma omp parallel for reduction(+:sink)
-    for (int i = 0; i < static_cast<int>(pairs.size()); ++i) {
-        sink += damerau_levenshtein_true(pairs[i].first, pairs[i].second);
-    }
+auto t0 = std::chrono::high_resolution_clock::now();
+
+#pragma omp parallel for reduction(+:sink) schedule(static)
+for (int i = 0; i < static_cast<int>(pairs.size()); ++i) {
+    sink += damerau_levenshtein_true(pairs[i].first, pairs[i].second);
+}
 
     auto t1 = std::chrono::high_resolution_clock::now();
     auto us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
@@ -283,7 +433,7 @@ static double time_one_pair_us(
 static void run_batch_benchmark_to_csv(const std::string& csv_path) {
     std::mt19937 rng(123456);
 
-    const std::vector<int> lengths = { 50, 100, 200, 500, 1000, 2000, 4000 };
+    const std::vector<int> lengths = { 32, 50, 64, 100, 200, 500, 1000, 2000, 4000, 8000, 12000 };
 
     std::ofstream out(csv_path, std::ios::out | std::ios::trunc);
     if (!out) {
@@ -291,7 +441,7 @@ static void run_batch_benchmark_to_csv(const std::string& csv_path) {
         std::exit(1);
     }
 
-    out << "length,iters,baseline_us,simd_us,openmp_us,simd_speedup,openmp_speedup\n";
+    out << "length,iters,baseline_us,simd_old_us,simd_new_us,bp_scalar_us,bp_avx2_us,openmp_us,simd_old_speedup,simd_new_speedup,bp_scalar_speedup,bp_avx2_speedup,openmp_speedup\n";
     std::cout << "Writing results to: " << csv_path << "\n";
 
     for (int L : lengths) {
@@ -299,24 +449,38 @@ static void run_batch_benchmark_to_csv(const std::string& csv_path) {
         std::string b = random_dna(L, rng);
 
         int iters = 200;
-        if (L >= 500)  iters = 50;
-        if (L >= 1000) iters = 20;
-        if (L >= 2000) iters = 10;
-        if (L >= 4000) iters = 5;
+        if (L >= 500)   iters = 50;
+        if (L >= 1000)  iters = 20;
+        if (L >= 2000)  iters = 10;
+        if (L >= 4000)  iters = 5;
+        if (L >= 8000)  iters = 3;
+        if (L >= 12000) iters = 2;
 
         double baseline_us = time_one_pair_us(damerau_levenshtein_true, a, b, iters);
-        double simd_us = time_one_pair_us(damerau_levenshtein_simd, a, b, iters);
+        double simd_old_us = time_one_pair_us(damerau_levenshtein_simd_cost_only, a, b, iters);
+        double simd_new_us = time_one_pair_us(damerau_levenshtein_simd_core_avx2, a, b, iters);
+        double bp_scalar_us = time_one_pair_us(damerau_levenshtein_bp_scalar, a, b, iters);
+        double bp_avx2_us = time_one_pair_us(damerau_levenshtein_bp_avx2, a, b, iters);
         double openmp_us = time_one_pair_us(damerau_levenshtein_openmp, a, b, iters);
 
-        double simd_speedup = baseline_us / simd_us;
+        double simd_old_speedup = baseline_us / simd_old_us;
+        double simd_new_speedup = baseline_us / simd_new_us;
+        double bp_scalar_speedup = baseline_us / bp_scalar_us;
+        double bp_avx2_speedup = baseline_us / bp_avx2_us;
         double openmp_speedup = baseline_us / openmp_us;
 
         std::cout << "L=" << L
             << "  iters=" << iters
             << "  baseline_us=" << std::fixed << std::setprecision(3) << baseline_us
-            << "  simd_us=" << simd_us
+            << "  simd_old_us=" << simd_old_us
+            << "  simd_new_us=" << simd_new_us
+            << "  bp_scalar_us=" << bp_scalar_us
+            << "  bp_avx2_us=" << bp_avx2_us
             << "  openmp_us=" << openmp_us
-            << "  simd_speedup=" << simd_speedup
+            << "  simd_old_speedup=" << simd_old_speedup
+            << "  simd_new_speedup=" << simd_new_speedup
+            << "  bp_scalar_speedup=" << bp_scalar_speedup
+            << "  bp_avx2_speedup=" << bp_avx2_speedup
             << "  openmp_speedup=" << openmp_speedup
             << "\n";
 
@@ -324,9 +488,15 @@ static void run_batch_benchmark_to_csv(const std::string& csv_path) {
             << iters << ","
             << std::fixed << std::setprecision(6)
             << baseline_us << ","
-            << simd_us << ","
+            << simd_old_us << ","
+            << simd_new_us << ","
+            << bp_scalar_us << ","
+            << bp_avx2_us << ","
             << openmp_us << ","
-            << simd_speedup << ","
+            << simd_old_speedup << ","
+            << simd_new_speedup << ","
+            << bp_scalar_speedup << ","
+            << bp_avx2_speedup << ","
             << openmp_speedup << "\n";
     }
 
@@ -345,7 +515,7 @@ static void run_parallel_batch_benchmark_to_csv(const std::string& csv_path)
         std::exit(1);
     }
 
-    out << "length,pair_count,serial_batch_us,openmp_batch_us,batch_speedup\n";
+    out << "length,pair_count,serial_batch_us,openmp_2_us,openmp_4_us,openmp_8_us,openmp_16_us,speedup_2,speedup_4,speedup_8,speedup_16\n";
     std::cout << "Writing batch-parallel results to: " << csv_path << "\n";
 
     for (int L : lengths) {
@@ -358,23 +528,43 @@ static void run_parallel_batch_benchmark_to_csv(const std::string& csv_path)
         auto pairs = make_random_pairs(pair_count, L, rng);
 
         double serial_batch_us = batch_true_us(pairs);
-        double openmp_batch_us_value = batch_openmp_us(pairs);
-        double batch_speedup = serial_batch_us / openmp_batch_us_value;
 
-        std::cout << "BATCH"
-            << "  L=" << L
-            << "  pair_count=" << pair_count
-            << "  serial_batch_us=" << std::fixed << std::setprecision(3) << serial_batch_us
-            << "  openmp_batch_us=" << openmp_batch_us_value
-            << "  batch_speedup=" << batch_speedup
-            << "\n";
+        double openmp_2_us = batch_openmp_us(pairs, 2);
+        double openmp_4_us = batch_openmp_us(pairs, 4);
+        double openmp_8_us = batch_openmp_us(pairs, 8);
+        double openmp_16_us = batch_openmp_us(pairs, 16);
+
+        double speedup_2 = serial_batch_us / openmp_2_us;
+        double speedup_4 = serial_batch_us / openmp_4_us;
+        double speedup_8 = serial_batch_us / openmp_8_us;
+        double speedup_16 = serial_batch_us / openmp_16_us;
 
         out << L << ","
             << pair_count << ","
             << std::fixed << std::setprecision(6)
             << serial_batch_us << ","
-            << openmp_batch_us_value << ","
-            << batch_speedup << "\n";
+            << openmp_2_us << ","
+            << openmp_4_us << ","
+            << openmp_8_us << ","
+            << openmp_16_us << ","
+            << speedup_2 << ","
+            << speedup_4 << ","
+            << speedup_8 << ","
+            << speedup_16 << "\n";
+
+        std::cout << "BATCH"
+            << "  L=" << L
+            << "  pair_count=" << pair_count
+            << "  serial_batch_us=" << std::fixed << std::setprecision(3) << serial_batch_us
+            << "  omp2_us=" << openmp_2_us
+            << "  omp4_us=" << openmp_4_us
+            << "  omp8_us=" << openmp_8_us
+            << "  omp16_us=" << openmp_16_us
+            << "  speedup2=" << speedup_2
+            << "  speedup4=" << speedup_4
+            << "  speedup8=" << speedup_8
+            << "  speedup16=" << speedup_16
+            << "\n";
     }
 
     out.close();
@@ -396,7 +586,10 @@ static void quick_unit_tests() {
 
     for (const auto& c : cases) {
         int got_true = damerau_levenshtein_true(c.a, c.b);
-        int got_simd = damerau_levenshtein_simd(c.a, c.b);
+        int got_simd_old = damerau_levenshtein_simd_cost_only(c.a, c.b);
+        int got_simd_new = damerau_levenshtein_simd_core_avx2(c.a, c.b);
+        int got_bp_scalar = damerau_levenshtein_bp_scalar(c.a, c.b);
+        int got_bp_avx2 = damerau_levenshtein_bp_avx2(c.a, c.b);
         int got_openmp = damerau_levenshtein_openmp(c.a, c.b);
         if (got_openmp != c.expected) {
             std::cerr << "[openmp mismatch] a=" << c.a
@@ -406,10 +599,17 @@ static void quick_unit_tests() {
             std::exit(1);
         }
 
-        if (got_true != got_simd) {
-            std::cout << "[ERROR] true/simd mismatch\n";
+        if (got_true != got_bp_scalar) {
+            std::cout << "[ERROR] true/bp_scalar mismatch\n";
             std::cout << "a = " << c.a << ", b = " << c.b << std::endl;
-            std::cout << "true = " << got_true << ", simd = " << got_simd << std::endl;
+            std::cout << "true = " << got_true << ", bp_scalar = " << got_bp_scalar << std::endl;
+            std::exit(1);
+        }
+
+        if (got_true != got_bp_avx2) {
+            std::cout << "[ERROR] true/bp_avx2 mismatch\n";
+            std::cout << "a = " << c.a << ", b = " << c.b << std::endl;
+            std::cout << "true = " << got_true << ", bp_avx2 = " << got_bp_avx2 << std::endl;
             std::exit(1);
         }
     }
